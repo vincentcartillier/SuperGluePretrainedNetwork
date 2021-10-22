@@ -230,6 +230,11 @@ class SuperGlue(nn.Module):
         desc0, desc1 = data['descriptors0'], data['descriptors1']
         kpts0, kpts1 = data['keypoints0'], data['keypoints1']
 
+        print(desc0.shape)
+        print(kpts0.shape)
+        print(desc1.shape)
+        stop
+
         if kpts0.shape[1] == 0 or kpts1.shape[1] == 0:  # no keypoints
             shape0, shape1 = kpts0.shape[:-1], kpts1.shape[:-1]
             return {
@@ -256,7 +261,7 @@ class SuperGlue(nn.Module):
         # Compute matching descriptor distance.
         scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
         scores = scores / self.config['descriptor_dim']**.5
-
+        
         # Run the optimal transport.
         scores = log_optimal_transport(
             scores, self.bin_score,
@@ -281,3 +286,106 @@ class SuperGlue(nn.Module):
             'matching_scores0': mscores0,
             'matching_scores1': mscores1,
         }
+
+class Sinkhorn(nn.Module):
+    """Sinkhorn Matcher
+    """
+    default_config = {
+        'descriptor_dim': 256,
+        'weights': 'indoor',
+        'keypoint_encoder': [32, 64, 128, 256],
+        'GNN_layers': ['self', 'cross'] * 9,
+        'sinkhorn_iterations': 100,
+        'match_threshold': 0.2,
+    }
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        #self.final_proj = nn.Conv1d(
+        #    self.config['descriptor_dim'], self.config['descriptor_dim'],
+        #    kernel_size=1, bias=True)
+
+        #bin_score = torch.nn.Parameter(torch.tensor(5.))
+        #self.register_parameter('bin_score', bin_score)
+        
+        self.layer_to_bin = nn.Sequential(
+            nn.Linear(2*self.config['descriptor_dim'], self.config['descriptor_dim']),
+            nn.ReLU(),
+            nn.Linear(self.config['descriptor_dim'], 1),
+                                  )
+        
+        if self.config['use_pretrain_weights']:
+            assert self.config['weights'] in ['indoor', 'outdoor']
+            path = Path(__file__).parent
+            path = path / 'weights/sinkhorn_{}.pth'.format(self.config['weights'])
+            self.load_state_dict(torch.load(str(path)))
+            print('Loaded SuperGlue model (\"{}\" weights)'.format(
+                self.config['weights']))
+
+    def forward(self, data):
+        """Run SuperGlue on a pair of keypoints and descriptors"""
+        output = {
+            'matches0':[],
+            'matches1':[],
+            'matches_scores0':[],
+            'matches_scores1':[],
+            'scores':[],
+        }
+        B = len(data['descriptors0'])
+        for b in range(B):
+            desc0, desc1 = data['descriptors0'][b], data['descriptors1'][b]
+            #kpts0, kpts1 = data['keypoints0'], data['keypoints1']
+            desc0 = desc0.unsqueeze(0)
+            desc1 = desc1.unsqueeze(0)
+            
+            desc0_mean = torch.mean(desc0, dim=2)
+            desc1_mean = torch.mean(desc1, dim=2)
+            all_desc_cat = torch.cat((desc0_mean, desc1_mean), dim=1)
+
+            #compute bin
+            delta_bin_score = self.layer_to_bin(all_desc_cat)
+            delta_bin_score = delta_bin_score * 100.0
+
+            # Final MLP projection.
+            #mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+            mdesc0 = desc0
+            mdesc1 = desc1
+
+            # Compute matching descriptor distance.
+            scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
+            scores = scores / self.config['descriptor_dim']**.5
+
+            bin_score = scores.mean()
+            bin_score = bin_score + delta_bin_score
+            self.bin_score = bin_score
+
+            # Run the optimal transport.
+            scores = log_optimal_transport(
+                scores, self.bin_score,
+                iters=self.config['sinkhorn_iterations'])
+
+            # Get the matches with score above "match_threshold".
+            max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
+            indices0, indices1 = max0.indices, max1.indices
+            mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
+            mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
+            zero = scores.new_tensor(0)
+            mscores0 = torch.where(mutual0, max0.values.exp(), zero)
+            mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
+            valid0 = mutual0 & (mscores0 > self.config['match_threshold'])
+            valid1 = mutual1 & valid0.gather(1, indices1)
+            indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
+            indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
+            
+            output['matches0'].append(indices0)
+            output['matches1'].append(indices1)
+            output['matches_scores0'].append(mscores0)
+            output['matches_scores1'].append(mscores1)
+            output['scores'].append(scores[0])
+
+        return output
+
+
+
