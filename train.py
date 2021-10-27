@@ -151,7 +151,7 @@ def train(rank, world_size, cfg):
                 loss /= world_size
 
                 if (rank ==0):
-                    fmt_str = "Iter: {:d} == Epoch [{:d}/{:d}] == Loss: {:.4f} == Time/Image: {:.4f}"
+                    fmt_str = "Iter: {:d} == Epoch [{:d}/{:d}] == Loss: {:.4f} == Time/Image: {:.4f} == bin_score: {:.4f}"
 
                     print_str = fmt_str.format(
                         iter,
@@ -159,11 +159,13 @@ def train(rank, world_size, cfg):
                         cfg["training"]["train_epoch"],
                         loss.item(),
                         time_meter.avg / cfg["training"]["batch_size"],
+                        model.module.bin_score.item(),
                     )
 
                     print(print_str)
-                    print(model.module.bin_score)
+                    logger.info(print_str)
                     writer.add_scalar("loss/train_loss", loss.item(), iter)
+                    writer.add_scalar("bin_score", model.module.bin_score.item(), iter)
                     time_meter.reset()
 
         model.eval()

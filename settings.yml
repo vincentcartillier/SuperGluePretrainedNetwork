@@ -1,7 +1,7 @@
-name_experiment: 3d_smnet_matcher_sinkhorn
+name_experiment: 3d_smnet_matcher_sinkhorn_debug_find_init_bin
 model:
     arch: sinkhorn
-    use_pretrain_weights: False
+    use_pretrain_weights: True
     weights: indoor
     descriptor_dim: 128
     sinkhorn_iterations: 100
@@ -13,12 +13,12 @@ data:
     val_obm_dir: ../../data/experiments/expe_112/observed_pred_OBM/val/observed_OBM_wdescriptors/
     skip_ep: ../../data/expe_102_skip_episodes.json
 training:
-    train_epoch: 20
+    train_epoch: 2000
     batch_size: 8
     n_workers: 4
     print_interval: 20
     optimizer:
-        lr: 5.0e-4
+        lr: 5.0e-3
         weight_decay: 4.0e-4
     resume:
     load_model:

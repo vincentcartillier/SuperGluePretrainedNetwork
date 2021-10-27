@@ -233,7 +233,9 @@ class SuperGlue(nn.Module):
         print(desc0.shape)
         print(kpts0.shape)
         print(desc1.shape)
-        stop
+
+        print(desc0.mean(), desc0.max(), desc0.min())
+        print(desc1.mean(), desc1.max(), desc1.min())
 
         if kpts0.shape[1] == 0 or kpts1.shape[1] == 0:  # no keypoints
             shape0, shape1 = kpts0.shape[:-1], kpts1.shape[:-1]
@@ -258,14 +260,22 @@ class SuperGlue(nn.Module):
         # Final MLP projection.
         mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
 
+        print(mdesc0.mean(), mdesc0.max(), mdesc0.min())
+        print(mdesc1.mean(), mdesc1.max(), mdesc1.min())
+
         # Compute matching descriptor distance.
         scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
         scores = scores / self.config['descriptor_dim']**.5
-        
+
+        print(scores.min(), scores.mean(), scores.max())
+
         # Run the optimal transport.
         scores = log_optimal_transport(
             scores, self.bin_score,
             iters=self.config['sinkhorn_iterations'])
+        
+        print(scores.min(), scores.mean(), scores.max())
+        stop
 
         # Get the matches with score above "match_threshold".
         max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
@@ -303,19 +313,13 @@ class Sinkhorn(nn.Module):
         super().__init__()
         self.config = config
 
-        #self.final_proj = nn.Conv1d(
-        #    self.config['descriptor_dim'], self.config['descriptor_dim'],
-        #    kernel_size=1, bias=True)
+        self.final_proj = nn.Conv1d(
+            2*self.config['descriptor_dim'], 2*self.config['descriptor_dim'],
+            kernel_size=1, bias=True)
 
-        #bin_score = torch.nn.Parameter(torch.tensor(5.))
-        #self.register_parameter('bin_score', bin_score)
-        
-        self.layer_to_bin = nn.Sequential(
-            nn.Linear(2*self.config['descriptor_dim'], self.config['descriptor_dim']),
-            nn.ReLU(),
-            nn.Linear(self.config['descriptor_dim'], 1),
-                                  )
-        
+        bin_score = torch.nn.Parameter(torch.tensor(5.))
+        self.register_parameter('bin_score', bin_score)
+
         if self.config['use_pretrain_weights']:
             assert self.config['weights'] in ['indoor', 'outdoor']
             path = Path(__file__).parent
@@ -339,32 +343,25 @@ class Sinkhorn(nn.Module):
             #kpts0, kpts1 = data['keypoints0'], data['keypoints1']
             desc0 = desc0.unsqueeze(0)
             desc1 = desc1.unsqueeze(0)
-            
-            desc0_mean = torch.mean(desc0, dim=2)
-            desc1_mean = torch.mean(desc1, dim=2)
-            all_desc_cat = torch.cat((desc0_mean, desc1_mean), dim=1)
 
-            #compute bin
-            delta_bin_score = self.layer_to_bin(all_desc_cat)
-            delta_bin_score = delta_bin_score * 100.0
+            desc0 = torch.cat((desc0,desc0), dim=1)
+            desc1 = torch.cat((desc1,desc1), dim=1)
 
             # Final MLP projection.
-            #mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
-            mdesc0 = desc0
-            mdesc1 = desc1
+            mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+
+            descriptor_dim = mdesc0.shape[1]
 
             # Compute matching descriptor distance.
             scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
-            scores = scores / self.config['descriptor_dim']**.5
-
-            bin_score = scores.mean()
-            bin_score = bin_score + delta_bin_score
-            self.bin_score = bin_score
-
+            scores = scores / descriptor_dim**.5
+            
             # Run the optimal transport.
             scores = log_optimal_transport(
                 scores, self.bin_score,
                 iters=self.config['sinkhorn_iterations'])
+            
+            scores = torch.nn.functional.softmax(scores, dim=2)
 
             # Get the matches with score above "match_threshold".
             max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
@@ -378,7 +375,7 @@ class Sinkhorn(nn.Module):
             valid1 = mutual1 & valid0.gather(1, indices1)
             indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
             indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
-            
+
             output['matches0'].append(indices0)
             output['matches1'].append(indices1)
             output['matches_scores0'].append(mscores0)
