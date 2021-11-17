@@ -1,0 +1,32 @@
+name_experiment: 3d_smnet_matcher_proposal_sinkhorn_wz
+model:
+    arch: sinkhorn_wz
+    use_pretrain_weights: False
+    weights: indoor
+    descriptor_dim: 128
+    sinkhorn_iterations: 100
+    match_threshold: 0.05
+data:
+    train_episode_dir: ../../data/experiments/expe_310/data/train/episodes/
+    train_obm_dir: ../../data/experiments/expe_310/observed_pred_OBM/train/observed_OBM_wdescriptors/
+    val_episode_dir: ../../data/experiments/expe_308/data/val/episodes/
+    val_obm_dir: ../../data/experiments/expe_308/observed_pred_OBM/val/observed_OBM_wdescriptors/
+    skip_ep: ../../data/expe_102_skip_episodes.json
+training:
+    train_epoch: 2000
+    batch_size: 8
+    n_workers: 4
+    print_interval: 20
+    optimizer:
+        lr: 5.0e-3
+        weight_decay: 4.0e-4
+    resume:
+    load_model:
+loss:
+    margin: 10.0
+seed: 9876
+eval_cfg:
+    dir_obm: /nethome/vcartillier3/3D-SMNet/data/experiments/expe_308/observed_pred_OBM/val/observed_OBM_wdescriptors/
+    dir_episodes: /nethome/vcartillier3/3D-SMNet/data/experiments/expe_308/data/val/episodes/
+    skip_ep: /nethome/vcartillier3/3D-SMNet/data/expe_102_skip_episodes.json
+    split: val

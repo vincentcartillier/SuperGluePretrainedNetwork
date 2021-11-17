@@ -1,7 +1,7 @@
-name_experiment: 3d_smnet_matcher_pointnet_sinkhorn
+name_experiment: 3d_smnet_matcher_pointnet_sinkhorn_wzatt_big
 model:
-    arch: sinkhorn
-    use_pretrain_weights: True
+    arch: sinkhorn_wzatt_big
+    use_pretrain_weights: False
     weights: indoor
     descriptor_dim: 256
     sinkhorn_iterations: 100
@@ -19,7 +19,7 @@ training:
     print_interval: 20
     optimizer:
         lr: 5.0e-3
-        weight_decay: 4.0e-4
+        weight_decay: 1.0e-6
     resume:
     load_model:
 loss:

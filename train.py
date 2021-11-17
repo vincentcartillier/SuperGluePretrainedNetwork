@@ -18,6 +18,12 @@ from tensorboardX import SummaryWriter
 from torch.utils.data import DistributedSampler
 
 from models.superglue import Sinkhorn
+from models.superglue import SuperGlue3DSMNet as SuperGlue
+from models.superglue import SuperGlue3DSMNet_plusplus as SuperGlue_plusplus
+from models.superglue_3dsmnet import Sinkhorn_wGNN
+from models.superglue_3dsmnet import Sinkhorn_wZ
+from models.superglue_3dsmnet import Sinkhorn_wZatt
+from models.superglue_3dsmnet import Sinkhorn_wZatt_Big
 from dataloader import DescriptorsEpisode
 from matcher_training_utils import get_logger
 from metrics import averageMeter
@@ -87,7 +93,22 @@ def train(rank, world_size, cfg):
     )
 
     # Setup Model
-    model = Sinkhorn(cfg['model'])
+    if cfg['model']['arch'] == 'sinkhorn':
+        model = Sinkhorn(cfg['model'])
+    elif cfg['model']['arch'] == 'superglue':
+        model = SuperGlue(cfg['model'])
+    elif cfg['model']['arch'] == 'superglue++':
+        model = SuperGlue_plusplus(cfg['model'])
+    elif cfg['model']['arch'] == 'sinkhorn_wgnn':
+        model = Sinkhorn_wGNN(cfg['model'])
+    elif cfg['model']['arch'] == 'sinkhorn_wz':
+        model = Sinkhorn_wZ(cfg['model'])
+    elif cfg['model']['arch'] == 'sinkhorn_wzatt':
+        model = Sinkhorn_wZatt(cfg['model'])
+    elif cfg['model']['arch'] == 'sinkhorn_wzatt_big':
+        model = Sinkhorn_wZatt_Big(cfg['model'])
+    else:
+        raise ValueError()
     model = model.to(device)
 
     if device.type == 'cuda':
@@ -119,6 +140,7 @@ def train(rank, world_size, cfg):
     time_meter = averageMeter()
     val_loss_meter = averageMeter()
     best_val_loss = 100.0
+    best_val_matching_acc = 0.0
 
     # start training
     iter = start_iter
@@ -194,11 +216,12 @@ def train(rank, world_size, cfg):
             logger.info("Iter %d val Loss: %.4f" % (iter, val_loss_avg))
             logger.info("Iter %d val matching acc: %.4f" % (iter, val_matching_acc))
 
-            if val_loss_avg < best_val_loss:
-                best_val_loss = val_loss_avg
+            if val_matching_acc > best_val_matching_acc:
+                best_val_matching_acc = val_matching_acc
                 state = {
                     "epoch": epoch,
                     'best_val_loss':best_val_loss,
+                    'best_val_matching_acc':best_val_matching_acc,
                     "iter": iter,
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
@@ -233,8 +256,15 @@ def eval(net, cfg):
     matcher = HungarianMatcher()
     metric_helper = MatchingAccuracy()
 
+    split = cfg['split']
     obm_dir = cfg['dir_obm']
     dir_episodes = cfg['dir_episodes']
+    if 'skip_ep' in cfg:
+        episodes_to_skip = json.load(open(cfg['skip_ep'], 'r'))
+        skip_ep = episodes_to_skip['skip_ep'][split]
+    else:
+        skip_ep = None
+
     episodes = os.listdir(dir_episodes)
     num = 0
     total = 0
@@ -242,6 +272,9 @@ def eval(net, cfg):
         for episode in episodes:
             uid = episode.split('.')[0]
             uid = int(uid)
+            if skip_ep is not None:
+                if uid in skip_ep:
+                    continue
 
             # -- get OBM - A
             object_map_filename_A = os.path.join(obm_dir,

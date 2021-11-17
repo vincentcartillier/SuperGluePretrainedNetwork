@@ -1,45 +1,3 @@
-# %BANNER_BEGIN%
-# ---------------------------------------------------------------------
-# %COPYRIGHT_BEGIN%
-#
-#  Magic Leap, Inc. ("COMPANY") CONFIDENTIAL
-#
-#  Unpublished Copyright (c) 2020
-#  Magic Leap, Inc., All Rights Reserved.
-#
-# NOTICE:  All information contained herein is, and remains the property
-# of COMPANY. The intellectual and technical concepts contained herein
-# are proprietary to COMPANY and may be covered by U.S. and Foreign
-# Patents, patents in process, and are protected by trade secret or
-# copyright law.  Dissemination of this information or reproduction of
-# this material is strictly forbidden unless prior written permission is
-# obtained from COMPANY.  Access to the source code contained herein is
-# hereby forbidden to anyone except current COMPANY employees, managers
-# or contractors who have executed Confidentiality and Non-disclosure
-# agreements explicitly covering such access.
-#
-# The copyright notice above does not evidence any actual or intended
-# publication or disclosure  of  this source code, which includes
-# information that is confidential and/or proprietary, and is a trade
-# secret, of  COMPANY.   ANY REPRODUCTION, MODIFICATION, DISTRIBUTION,
-# PUBLIC  PERFORMANCE, OR PUBLIC DISPLAY OF OR THROUGH USE  OF THIS
-# SOURCE CODE  WITHOUT THE EXPRESS WRITTEN CONSENT OF COMPANY IS
-# STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE LAWS AND
-# INTERNATIONAL TREATIES.  THE RECEIPT OR POSSESSION OF  THIS SOURCE
-# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS
-# TO REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE,
-# USE, OR SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
-#
-# %COPYRIGHT_END%
-# ----------------------------------------------------------------------
-# %AUTHORS_BEGIN%
-#
-#  Originating Authors: Paul-Edouard Sarlin
-#
-# %AUTHORS_END%
-# --------------------------------------------------------------------*/
-# %BANNER_END%
-
 from copy import deepcopy
 from pathlib import Path
 import torch
@@ -111,7 +69,7 @@ class AttentionalPropagation(nn.Module):
     def __init__(self, feature_dim: int, num_heads: int):
         super().__init__()
         self.attn = MultiHeadedAttention(num_heads, feature_dim)
-        self.mlp = MLP([feature_dim*2, feature_dim*2, feature_dim])
+        self.mlp = MLP([2*feature_dim, feature_dim])
         nn.init.constant_(self.mlp[-1].bias, 0.0)
 
     def forward(self, x, source):
@@ -122,12 +80,18 @@ class AttentionalPropagation(nn.Module):
 class AttentionalGNN(nn.Module):
     def __init__(self, feature_dim: int, layer_names: list):
         super().__init__()
+        feature_dim = 128
         self.layers = nn.ModuleList([
             AttentionalPropagation(feature_dim, 4)
             for _ in range(len(layer_names))])
         self.names = layer_names
+        self.maxpool = torch.nn.MaxPool1d(2,2)
 
     def forward(self, desc0, desc1):
+        desc0 = self.maxpool(desc0.permute(0,2,1))
+        desc1 = self.maxpool(desc1.permute(0,2,1))
+        desc0 = desc0.permute(0,2,1)
+        desc1 = desc1.permute(0,2,1)
         for layer, name in zip(self.layers, self.names):
             if name == 'cross':
                 src0, src1 = desc1, desc0
@@ -170,154 +134,53 @@ def log_optimal_transport(scores, alpha, iters: int):
     return Z
 
 
+def log_optimal_transport_zvec(scores, zA, zB, iters: int):
+    """ Perform Differentiable Optimal Transport in Log-space for stability"""
+    b, m, n = scores.shape
+    one = scores.new_tensor(1)
+    ms, ns = (m*one).to(scores), (n*one).to(scores)
+
+    bins0 = zA.unsqueeze(0).unsqueeze(-1)
+    bins1 = zB.unsqueeze(0).unsqueeze(0)
+    alpha = torch.ones((b,1,1), device=scores.device)
+
+    couplings = torch.cat([torch.cat([scores, bins0], -1),
+                           torch.cat([bins1, alpha], -1)], 1)
+
+    norm = - (ms + ns).log()
+    log_mu = torch.cat([norm.expand(m), ns.log()[None] + norm])
+    log_nu = torch.cat([norm.expand(n), ms.log()[None] + norm])
+    log_mu, log_nu = log_mu[None].expand(b, -1), log_nu[None].expand(b, -1)
+
+    Z = log_sinkhorn_iterations(couplings, log_mu, log_nu, iters)
+    Z = Z - norm  # multiply probabilities by M+N
+    return Z
+
+
+
+
 def arange_like(x, dim: int):
     return x.new_ones(x.shape[dim]).cumsum(0) - 1  # traceable in 1.1
 
 
-class SuperGlue(nn.Module):
-    """SuperGlue feature matching middle-end
 
-    Given two sets of keypoints and locations, we determine the
-    correspondences by:
-      1. Keypoint Encoding (normalization + visual feature and location fusion)
-      2. Graph Neural Network with multiple self and cross-attention layers
-      3. Final projection layer
-      4. Optimal Transport Layer (a differentiable Hungarian matching algorithm)
-      5. Thresholding matrix based on mutual exclusivity and a match_threshold
-
-    The correspondence ids use -1 to indicate non-matching points.
-
-    Paul-Edouard Sarlin, Daniel DeTone, Tomasz Malisiewicz, and Andrew
-    Rabinovich. SuperGlue: Learning Feature Matching with Graph Neural
-    Networks. In CVPR, 2020. https://arxiv.org/abs/1911.11763
-
-    """
-    default_config = {
-        'descriptor_dim': 256,
-        'weights': 'indoor',
-        'keypoint_encoder': [32, 64, 128, 256],
-        'GNN_layers': ['self', 'cross'] * 9,
-        'sinkhorn_iterations': 100,
-        'match_threshold': 0.2,
-    }
-
-    def __init__(self, config):
-        super().__init__()
-        self.config = {**self.default_config, **config}
-
-        self.kenc = KeypointEncoder(
-            self.config['descriptor_dim'], self.config['keypoint_encoder'])
-
-        self.gnn = AttentionalGNN(
-            self.config['descriptor_dim'], self.config['GNN_layers'])
-
-        self.final_proj = nn.Conv1d(
-            self.config['descriptor_dim'], self.config['descriptor_dim'],
-            kernel_size=1, bias=True)
-
-        bin_score = torch.nn.Parameter(torch.tensor(1.))
-        self.register_parameter('bin_score', bin_score)
-
-        assert self.config['weights'] in ['indoor', 'outdoor']
-        path = Path(__file__).parent
-        path = path / 'weights/superglue_{}.pth'.format(self.config['weights'])
-        self.load_state_dict(torch.load(str(path)))
-        print('Loaded SuperGlue model (\"{}\" weights)'.format(
-            self.config['weights']))
-
-    def forward(self, data):
-        """Run SuperGlue on a pair of keypoints and descriptors"""
-        desc0, desc1 = data['descriptors0'], data['descriptors1']
-        kpts0, kpts1 = data['keypoints0'], data['keypoints1']
-
-        if kpts0.shape[1] == 0 or kpts1.shape[1] == 0:  # no keypoints
-            shape0, shape1 = kpts0.shape[:-1], kpts1.shape[:-1]
-            return {
-                'matches0': kpts0.new_full(shape0, -1, dtype=torch.int),
-                'matches1': kpts1.new_full(shape1, -1, dtype=torch.int),
-                'matching_scores0': kpts0.new_zeros(shape0),
-                'matching_scores1': kpts1.new_zeros(shape1),
-            }
-
-        # Keypoint normalization.
-        kpts0 = normalize_keypoints(kpts0, data['image0'].shape)
-        kpts1 = normalize_keypoints(kpts1, data['image1'].shape)
-
-        print(desc0.mean(), desc0.max(), desc0.min())
-        print(desc1.mean(), desc1.max(), desc1.min())
-
-        # Keypoint MLP encoder.
-        desc0 = desc0 + self.kenc(kpts0, data['scores0'])
-        desc1 = desc1 + self.kenc(kpts1, data['scores1'])
-
-        print(desc0.mean(), desc0.max(), desc0.min())
-        print(desc1.mean(), desc1.max(), desc1.min())
-        stop
-
-        # Multi-layer Transformer network.
-        desc0, desc1 = self.gnn(desc0, desc1)
-
-        # Final MLP projection.
-        mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
-
-        print(mdesc0.mean(), mdesc0.max(), mdesc0.min())
-        print(mdesc1.mean(), mdesc1.max(), mdesc1.min())
-
-        # Compute matching descriptor distance.
-        scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
-        scores = scores / self.config['descriptor_dim']**.5
-
-        print(scores.min(), scores.mean(), scores.max())
-
-        # Run the optimal transport.
-        scores = log_optimal_transport(
-            scores, self.bin_score,
-            iters=self.config['sinkhorn_iterations'])
-
-        print(scores.min(), scores.mean(), scores.max())
-        stop
-
-        # Get the matches with score above "match_threshold".
-        max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
-        indices0, indices1 = max0.indices, max1.indices
-        mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
-        mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
-        zero = scores.new_tensor(0)
-        mscores0 = torch.where(mutual0, max0.values.exp(), zero)
-        mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
-        valid0 = mutual0 & (mscores0 > self.config['match_threshold'])
-        valid1 = mutual1 & valid0.gather(1, indices1)
-        indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
-        indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
-
-        return {
-            'matches0': indices0, # use -1 for invalid match
-            'matches1': indices1, # use -1 for invalid match
-            'matching_scores0': mscores0,
-            'matching_scores1': mscores1,
-        }
-
-
-
-class Sinkhorn(nn.Module):
+class Sinkhorn_wGNN(nn.Module):
     """Sinkhorn Matcher
     """
-    default_config = {
-        'descriptor_dim': 256,
-        'weights': 'indoor',
-        'keypoint_encoder': [32, 64, 128, 256],
-        'GNN_layers': ['self', 'cross'] * 9,
-        'sinkhorn_iterations': 100,
-        'match_threshold': 0.2,
-    }
-
     def __init__(self, config):
         super().__init__()
         self.config = config
 
+        GNN_layers = ['self', 'cross'] * 1
+        descriptor_dim = 256
+
+        self.gnn = AttentionalGNN(
+            descriptor_dim,
+            GNN_layers)
+
         self.final_proj = nn.Conv1d(
-            256,
-            256,
+            128,
+            128,
             kernel_size=1,
             bias=True)
 
@@ -354,106 +217,6 @@ class Sinkhorn(nn.Module):
             else:
                 assert desc0.shape[1] == 256
 
-            # Final MLP projection.
-            mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
-
-            descriptor_dim = mdesc0.shape[1]
-
-            # Compute matching descriptor distance.
-            scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
-            scores = scores / descriptor_dim**.5
-
-            # Run the optimal transport.
-            scores = log_optimal_transport(
-                scores, self.bin_score,
-                iters=self.config['sinkhorn_iterations'])
-
-            scores = torch.nn.functional.softmax(scores, dim=2)
-
-            # Get the matches with score above "match_threshold".
-            max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
-            indices0, indices1 = max0.indices, max1.indices
-            mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
-            mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
-            zero = scores.new_tensor(0)
-            mscores0 = torch.where(mutual0, max0.values.exp(), zero)
-            mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
-            valid0 = mutual0 & (mscores0 > self.config['match_threshold'])
-            valid1 = mutual1 & valid0.gather(1, indices1)
-            indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
-            indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
-
-            output['matches0'].append(indices0)
-            output['matches1'].append(indices1)
-            output['matches_scores0'].append(mscores0)
-            output['matches_scores1'].append(mscores1)
-            output['scores'].append(scores[0])
-
-        return output
-
-
-class SuperGlue3DSMNet(nn.Module):
-    """SuperGlue feature matching middle-end
-    """
-    default_config = {
-        'descriptor_dim': 256,
-        'weights': 'indoor',
-        'keypoint_encoder': [32, 64, 128, 256],
-        'GNN_layers': ['self', 'cross'] * 9,
-        'sinkhorn_iterations': 100,
-        'match_threshold': 0.2,
-    }
-
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-
-        GNN_layers = ['self', 'cross'] * 9
-        descriptor_dim = 256
-
-        self.gnn = AttentionalGNN(
-            descriptor_dim,
-            GNN_layers)
-
-        self.final_proj = nn.Conv1d(
-            descriptor_dim,
-            descriptor_dim,
-            kernel_size=1,
-            bias=True)
-
-        bin_score = torch.nn.Parameter(torch.tensor(1.))
-        self.register_parameter('bin_score', bin_score)
-
-        if self.config['use_pretrain_weights']:
-            assert self.config['weights'] in ['indoor', 'outdoor']
-            path = Path(__file__).parent
-            path = path / 'weights/superglue_3dsmnet_{}.pth'.format(self.config['weights'])
-            self.load_state_dict(torch.load(str(path)))
-            print('Loaded SuperGlue model (\"{}\" weights)'.format(
-                self.config['weights']))
-
-    def forward(self, data):
-        """Run SuperGlue on a pair of keypoints and descriptors"""
-        output = {
-            'matches0':[],
-            'matches1':[],
-            'matches_scores0':[],
-            'matches_scores1':[],
-            'scores':[],
-        }
-        B = len(data['descriptors0'])
-        for b in range(B):
-
-            desc0, desc1 = data['descriptors0'][b], data['descriptors1'][b]
-            desc0 = desc0.unsqueeze(0)
-            desc1 = desc1.unsqueeze(0)
-
-            if desc0.shape[1] == 128:
-                desc0 = torch.cat((desc0,desc0), dim=1)
-                desc1 = torch.cat((desc1,desc1), dim=1)
-            else:
-                assert desc0.shape[1] == 256
-
             desc0 = 2*torch.nn.functional.normalize(desc0, p=2, dim=1)
             desc1 = 2*torch.nn.functional.normalize(desc1, p=2, dim=1)
 
@@ -495,38 +258,21 @@ class SuperGlue3DSMNet(nn.Module):
             output['matches_scores1'].append(mscores1)
             output['scores'].append(scores[0])
 
-
         return output
 
 
-
-
-class SuperGlue3DSMNet_plusplus(nn.Module):
-    """SuperGlue feature matching middle-end
+class Sinkhorn_wZ(nn.Module):
+    """Sinkhorn Matcher
     """
-    default_config = {
-        'descriptor_dim': 256,
-        'weights': 'indoor',
-        'keypoint_encoder': [32, 64, 128, 256],
-        'GNN_layers': ['self', 'cross'] * 9,
-        'sinkhorn_iterations': 100,
-        'match_threshold': 0.2,
-    }
-
     def __init__(self, config):
         super().__init__()
         self.config = config
 
-        GNN_layers = ['self', 'cross'] * 9
         descriptor_dim = 256
 
-        self.gnn = AttentionalGNN(
-            descriptor_dim,
-            GNN_layers)
-
         self.final_proj = nn.Conv1d(
-            descriptor_dim,
-            descriptor_dim,
+            256,
+            256,
             kernel_size=1,
             bias=True)
 
@@ -541,7 +287,7 @@ class SuperGlue3DSMNet_plusplus(nn.Module):
         if self.config['use_pretrain_weights']:
             assert self.config['weights'] in ['indoor', 'outdoor']
             path = Path(__file__).parent
-            path = path / 'weights/superglue++_3dsmnet_{}.pth'.format(self.config['weights'])
+            path = path / 'weights/sinkhorn_wz_{}.pth'.format(self.config['weights'])
             self.load_state_dict(torch.load(str(path)))
             print('Loaded SuperGlue model (\"{}\" weights)'.format(
                 self.config['weights']))
@@ -557,8 +303,8 @@ class SuperGlue3DSMNet_plusplus(nn.Module):
         }
         B = len(data['descriptors0'])
         for b in range(B):
-
             desc0, desc1 = data['descriptors0'][b], data['descriptors1'][b]
+            #kpts0, kpts1 = data['keypoints0'], data['keypoints1']
             desc0 = desc0.unsqueeze(0)
             desc1 = desc1.unsqueeze(0)
 
@@ -567,12 +313,6 @@ class SuperGlue3DSMNet_plusplus(nn.Module):
                 desc1 = torch.cat((desc1,desc1), dim=1)
             else:
                 assert desc0.shape[1] == 256
-
-            desc0 = 2*torch.nn.functional.normalize(desc0, p=2, dim=1)
-            desc1 = 2*torch.nn.functional.normalize(desc1, p=2, dim=1)
-
-            # Multi-layer Transformer network.
-            desc0, desc1 = self.gnn(desc0, desc1)
 
             # Final MLP projection.
             mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
@@ -618,6 +358,358 @@ class SuperGlue3DSMNet_plusplus(nn.Module):
             output['matches_scores1'].append(mscores1)
             output['scores'].append(scores[0])
 
+        return output
+
+
+
+
+
+class Sinkhorn_wZatt(nn.Module):
+    """Sinkhorn Matcher
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        descriptor_dim = 256
+
+        self.final_proj = nn.Conv1d(
+            256,
+            256,
+            kernel_size=1,
+            bias=True)
+
+        self.attention = nn.Sequential(
+                #nn.Tanh(),
+                #nn.Dropout(0.5),
+                nn.Linear(512,64),
+                nn.ReLU(),
+                nn.Linear(64,1),
+        )
+
+        self.z = nn.Sequential(
+            nn.Linear(descriptor_dim, descriptor_dim),
+            nn.ReLU(),
+            nn.Linear(descriptor_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+        if self.config['use_pretrain_weights']:
+            assert self.config['weights'] in ['indoor', 'outdoor']
+            path = Path(__file__).parent
+            path = path / 'weights/sinkhorn_wz_{}.pth'.format(self.config['weights'])
+            self.load_state_dict(torch.load(str(path)))
+            print('Loaded SuperGlue model (\"{}\" weights)'.format(
+                self.config['weights']))
+
+    def forward(self, data):
+        """Run SuperGlue on a pair of keypoints and descriptors"""
+        output = {
+            'matches0':[],
+            'matches1':[],
+            'matches_scores0':[],
+            'matches_scores1':[],
+            'scores':[],
+        }
+        B = len(data['descriptors0'])
+        for b in range(B):
+            desc0, desc1 = data['descriptors0'][b], data['descriptors1'][b]
+            #kpts0, kpts1 = data['keypoints0'], data['keypoints1']
+            desc0 = desc0.unsqueeze(0)
+            desc1 = desc1.unsqueeze(0)
+
+            if desc0.shape[1] == 128:
+                desc0 = torch.cat((desc0,desc0), dim=1)
+                desc1 = torch.cat((desc1,desc1), dim=1)
+            else:
+                assert desc0.shape[1] == 256
+
+            # Final MLP projection.
+            mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+
+            # get z value estimate
+            nA = mdesc0.shape[2]
+            nB = mdesc1.shape[2]
+            tmp_A = mdesc0.unsqueeze(-1).repeat((1,1,1,nB)) # (1,256, nA, nB)
+            tmp_B = mdesc1.unsqueeze(2).repeat((1,1,nA,1)) # (1,256, nA, nB)
+            tmp_A = tmp_A.view((1,256,-1))
+            tmp_B = tmp_B.view((1,256,-1))
+
+            input_attention = torch.cat((tmp_A, tmp_B), dim=1)
+            input_attention = input_attention.permute(0,2,1)
+            attention_weights = self.attention(input_attention)
+            attention_weights = attention_weights.view(1,nA,nB,1)
+
+            tmp_A = tmp_A.view((1,256,nA,nB))
+            tmp_B = tmp_B.view((1,256,nA,nB))
+
+            # get z - A
+            prob_A = torch.nn.functional.softmax(attention_weights[0,:,:,0],
+                                                 dim=1)
+            prob_A = prob_A.unsqueeze(0).unsqueeze(0).repeat((1,256,1,1))
+            zfeat_A = torch.mul(tmp_B,prob_A)
+            zfeat_A = torch.sum(zfeat_A,dim=3)
+            zfeat_A = zfeat_A.permute(0,2,1)
+
+            zA = self.z(zfeat_A)
+            zA = zA[0,:,0]
+
+            # get z - B
+            prob_B = torch.nn.functional.softmax(attention_weights[0,:,:,0],
+                                                 dim=0)
+            prob_B = prob_B.unsqueeze(0).unsqueeze(0).repeat((1,256,1,1))
+            zfeat_B = torch.mul(tmp_A,prob_B)
+            zfeat_B = torch.sum(zfeat_B,dim=2)
+            zfeat_B = zfeat_B.permute(0,2,1)
+
+            zB = self.z(zfeat_B)
+            zB = zB[0,:,0]
+
+            self.bin_score = zA.mean()
+
+            descriptor_dim = mdesc0.shape[1]
+
+            # Compute matching descriptor distance.
+            scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
+            scores = scores / descriptor_dim**.5
+
+            # Run the optimal transport.
+            scores = log_optimal_transport_zvec(
+                scores, zA, zB,
+                iters=self.config['sinkhorn_iterations'])
+
+            scores = torch.nn.functional.softmax(scores, dim=2)
+
+            # Get the matches with score above "match_threshold".
+            max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
+            indices0, indices1 = max0.indices, max1.indices
+            mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
+            mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
+            zero = scores.new_tensor(0)
+            mscores0 = torch.where(mutual0, max0.values.exp(), zero)
+            mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
+            valid0 = mutual0 & (mscores0 > self.config['match_threshold'])
+            valid1 = mutual1 & valid0.gather(1, indices1)
+            indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
+            indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
+
+            output['matches0'].append(indices0)
+            output['matches1'].append(indices1)
+            output['matches_scores0'].append(mscores0)
+            output['matches_scores1'].append(mscores1)
+            output['scores'].append(scores[0])
 
         return output
+
+
+class Sinkhorn_wZatt_Big(nn.Module):
+    """Sinkhorn Matcher
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        descriptor_dim = 256
+
+        self.final_proj = nn.Conv1d(
+            256,
+            256,
+            kernel_size=1,
+            bias=True)
+
+        self.attention = nn.Sequential(
+                #nn.Tanh(),
+                #nn.Dropout(0.5),
+                nn.Linear(512,256),
+                nn.ReLU(),
+                nn.Linear(256,64),
+                nn.ReLU(),
+                nn.Linear(64,1),
+        )
+
+        self.z = nn.Sequential(
+            nn.Linear(2*descriptor_dim, descriptor_dim),
+            nn.ReLU(),
+            nn.Linear(descriptor_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+        if self.config['use_pretrain_weights']:
+            assert self.config['weights'] in ['indoor', 'outdoor']
+            path = Path(__file__).parent
+            path = path / 'weights/sinkhorn_wz_{}.pth'.format(self.config['weights'])
+            self.load_state_dict(torch.load(str(path)))
+            print('Loaded SuperGlue model (\"{}\" weights)'.format(
+                self.config['weights']))
+
+    def forward(self, data):
+        """Run SuperGlue on a pair of keypoints and descriptors"""
+        output = {
+            'matches0':[],
+            'matches1':[],
+            'matches_scores0':[],
+            'matches_scores1':[],
+            'scores':[],
+        }
+        B = len(data['descriptors0'])
+        for b in range(B):
+            desc0, desc1 = data['descriptors0'][b], data['descriptors1'][b]
+            #kpts0, kpts1 = data['keypoints0'], data['keypoints1']
+            desc0 = desc0.unsqueeze(0)
+            desc1 = desc1.unsqueeze(0)
+
+            if desc0.shape[1] == 128:
+                desc0 = torch.cat((desc0,desc0), dim=1)
+                desc1 = torch.cat((desc1,desc1), dim=1)
+            else:
+                assert desc0.shape[1] == 256
+
+            # Final MLP projection.
+            mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+
+            # get z value estimate
+            nA = mdesc0.shape[2]
+            nB = mdesc1.shape[2]
+            tmp_A = mdesc0.unsqueeze(-1).repeat((1,1,1,nB)) # (1,256, nA, nB)
+            tmp_B = mdesc1.unsqueeze(2).repeat((1,1,nA,1)) # (1,256, nA, nB)
+            tmp_A = tmp_A.view((1,256,-1))
+            tmp_B = tmp_B.view((1,256,-1))
+
+            input_attention = torch.cat((tmp_A, tmp_B), dim=1)
+            input_attention = input_attention.permute(0,2,1)
+            attention_weights = self.attention(input_attention)
+            attention_weights = attention_weights.view(1,nA,nB,1)
+
+            tmp_A = tmp_A.view((1,256,nA,nB))
+            tmp_B = tmp_B.view((1,256,nA,nB))
+
+            # get z - A
+            prob_A = torch.nn.functional.softmax(attention_weights[0,:,:,0],
+                                                 dim=1)
+            prob_A = prob_A.unsqueeze(0).unsqueeze(0).repeat((1,256,1,1))
+            zfeat_A = torch.mul(tmp_B,prob_A)
+            zfeat_A = torch.sum(zfeat_A,dim=3)
+            zfeat_A = zfeat_A.permute(0,2,1)
+            zfeat_A = torch.cat((zfeat_A, mdesc0.permute(0,2,1)), dim=2)
+
+            zA = self.z(zfeat_A)
+            zA = zA[0,:,0]
+
+            # get z - B
+            prob_B = torch.nn.functional.softmax(attention_weights[0,:,:,0],
+                                                 dim=0)
+            prob_B = prob_B.unsqueeze(0).unsqueeze(0).repeat((1,256,1,1))
+            zfeat_B = torch.mul(tmp_A,prob_B)
+            zfeat_B = torch.sum(zfeat_B,dim=2)
+            zfeat_B = zfeat_B.permute(0,2,1)
+            zfeat_B = torch.cat((zfeat_B, mdesc1.permute(0,2,1)), dim=2)
+
+            zB = self.z(zfeat_B)
+            zB = zB[0,:,0]
+
+            self.bin_score = zA.mean()
+
+            descriptor_dim = mdesc0.shape[1]
+
+            # Compute matching descriptor distance.
+            scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
+            scores = scores / descriptor_dim**.5
+
+            # Run the optimal transport.
+            scores = log_optimal_transport_zvec(
+                scores, zA, zB,
+                iters=self.config['sinkhorn_iterations'])
+
+            scores = torch.nn.functional.softmax(scores, dim=2)
+
+            # Get the matches with score above "match_threshold".
+            max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
+            indices0, indices1 = max0.indices, max1.indices
+            mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
+            mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
+            zero = scores.new_tensor(0)
+            mscores0 = torch.where(mutual0, max0.values.exp(), zero)
+            mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
+            valid0 = mutual0 & (mscores0 > self.config['match_threshold'])
+            valid1 = mutual1 & valid0.gather(1, indices1)
+            indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
+            indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
+
+            output['matches0'].append(indices0)
+            output['matches1'].append(indices1)
+            output['matches_scores0'].append(mscores0)
+            output['matches_scores1'].append(mscores1)
+            output['scores'].append(scores[0])
+
+        return output
+
+    def get_z_scores(self, data):
+        """Run SuperGlue on a pair of keypoints and descriptors"""
+        output = {
+            'zA':[],
+            'zB':[],
+        }
+        B = len(data['descriptors0'])
+        for b in range(B):
+            desc0, desc1 = data['descriptors0'][b], data['descriptors1'][b]
+            desc0 = desc0.unsqueeze(0)
+            desc1 = desc1.unsqueeze(0)
+
+            if desc0.shape[1] == 128:
+                desc0 = torch.cat((desc0,desc0), dim=1)
+                desc1 = torch.cat((desc1,desc1), dim=1)
+            else:
+                assert desc0.shape[1] == 256
+
+            # Final MLP projection.
+            mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+
+            # get z value estimate
+            nA = mdesc0.shape[2]
+            nB = mdesc1.shape[2]
+            tmp_A = mdesc0.unsqueeze(-1).repeat((1,1,1,nB)) # (1,256, nA, nB)
+            tmp_B = mdesc1.unsqueeze(2).repeat((1,1,nA,1)) # (1,256, nA, nB)
+            tmp_A = tmp_A.view((1,256,-1))
+            tmp_B = tmp_B.view((1,256,-1))
+
+            input_attention = torch.cat((tmp_A, tmp_B), dim=1)
+            input_attention = input_attention.permute(0,2,1)
+            attention_weights = self.attention(input_attention)
+            attention_weights = attention_weights.view(1,nA,nB,1)
+
+            tmp_A = tmp_A.view((1,256,nA,nB))
+            tmp_B = tmp_B.view((1,256,nA,nB))
+
+            # get z - A
+            prob_A = torch.nn.functional.softmax(attention_weights[0,:,:,0],
+                                                 dim=1)
+            prob_A = prob_A.unsqueeze(0).unsqueeze(0).repeat((1,256,1,1))
+            zfeat_A = torch.mul(tmp_B,prob_A)
+            zfeat_A = torch.sum(zfeat_A,dim=3)
+            zfeat_A = zfeat_A.permute(0,2,1)
+            zfeat_A = torch.cat((zfeat_A, mdesc0.permute(0,2,1)), dim=2)
+
+            zA = self.z(zfeat_A)
+            zA = zA[0,:,0]
+
+            # get z - B
+            prob_B = torch.nn.functional.softmax(attention_weights[0,:,:,0],
+                                                 dim=0)
+            prob_B = prob_B.unsqueeze(0).unsqueeze(0).repeat((1,256,1,1))
+            zfeat_B = torch.mul(tmp_A,prob_B)
+            zfeat_B = torch.sum(zfeat_B,dim=2)
+            zfeat_B = zfeat_B.permute(0,2,1)
+            zfeat_B = torch.cat((zfeat_B, mdesc1.permute(0,2,1)), dim=2)
+
+            zB = self.z(zfeat_B)
+            zB = zB[0,:,0]
+
+            output['zA'].append(zA)
+            output['zB'].append(zB)
+
+        return output
+ 
+
 

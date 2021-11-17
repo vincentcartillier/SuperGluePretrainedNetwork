@@ -14,7 +14,7 @@ class SuperGlueLoss():
             rows = gt_matches[b][:,0]
             cols = gt_matches[b][:,1]
             #tmp_loss = -torch.log(scores[b][rows, cols].exp())
-            tmp_loss = -torch.log(scores[b][rows, cols])
+            tmp_loss = -torch.log(scores[b][rows, cols]+0.001)
             loss += torch.sum(tmp_loss)
             total += len(tmp_loss)
             # -- for i in range(len(gt_matches[b])):
